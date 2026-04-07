@@ -63,3 +63,29 @@ def test_server_timestamp_transform_roundtrip(tmp_path, monkeypatch):
         assert isinstance(persisted["e1"]["ts"]["value"], str)
     finally:
         running.stop()
+
+
+def test_digit_leading_field_key_stored_without_backticks(tmp_path, monkeypatch):
+    """Field names starting with a digit must be stored/returned without backticks.
+
+    The Firestore Python SDK wraps such names in backticks when building the
+    gRPC FieldMask (e.g. ``items.`019abc```).  _nested_set/_nested_get must
+    strip those wrappers so dict keys remain clean.
+    """
+    running = start_grpc_emulator(tmp_path, host="127.0.0.1", port=0)
+    try:
+        monkeypatch.setenv("FIRESTORE_EMULATOR_HOST", f"{running.host}:{running.port}")
+        client = firestore.Client(project="demo-project")
+
+        doc_ref = client.collection("things").document("doc1")
+        doc_ref.set({"items": {}})
+
+        field_id = "019d69eae30d71498f2ae85952dc509c"
+        doc_ref.update({f"items.{field_id}": {"value": 42}})
+
+        data = doc_ref.get().to_dict()
+        keys = list(data["items"].keys())
+        assert keys == [field_id], f"Expected bare key, got: {keys}"
+        assert data["items"][field_id] == {"value": 42}
+    finally:
+        running.stop()

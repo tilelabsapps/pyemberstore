@@ -392,9 +392,31 @@ def _apply_update_mask(
     return merged
 
 
+def _split_field_path(dotted_path: str) -> list[str]:
+    """Split a Firestore field path on unescaped dots, stripping backtick wrappers.
+
+    The Firestore SDK wraps field names that are not valid JS identifiers (e.g.
+    those starting with a digit) in backticks when building gRPC FieldMasks.
+    A naive split(".") would keep the backtick characters as part of the key.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    in_backtick = False
+    for ch in dotted_path:
+        if ch == "`":
+            in_backtick = not in_backtick
+        elif ch == "." and not in_backtick:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    return parts
+
+
 def _nested_get(payload: dict[str, Any], dotted_path: str) -> tuple[Any, bool]:
     current: Any = payload
-    for part in dotted_path.split("."):
+    for part in _split_field_path(dotted_path):
         if not isinstance(current, dict) or part not in current:
             return None, False
         current = current[part]
@@ -403,7 +425,7 @@ def _nested_get(payload: dict[str, Any], dotted_path: str) -> tuple[Any, bool]:
 
 def _nested_set(payload: dict[str, Any], dotted_path: str, value: Any) -> None:
     current: dict[str, Any] = payload
-    parts = dotted_path.split(".")
+    parts = _split_field_path(dotted_path)
     for part in parts[:-1]:
         node = current.get(part)
         if not isinstance(node, dict):
@@ -415,7 +437,7 @@ def _nested_set(payload: dict[str, Any], dotted_path: str, value: Any) -> None:
 
 def _nested_delete(payload: dict[str, Any], dotted_path: str) -> None:
     current: Any = payload
-    parts = dotted_path.split(".")
+    parts = _split_field_path(dotted_path)
     for part in parts[:-1]:
         if not isinstance(current, dict) or part not in current:
             return

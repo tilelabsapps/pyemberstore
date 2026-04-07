@@ -1,0 +1,29 @@
+[project]
+name = "pyemberstore"
+version = "0.1.0"
+description = "Firestore-compatible local JSON store for Python development and testing"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "google-cloud-firestore>=2.21.0",
+  "fastapi>=0.116.0",
+  "uvicorn>=0.35.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0",
+  "httpx>=0.28.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+pyemberstore = "pyemberstore.__main__:main"

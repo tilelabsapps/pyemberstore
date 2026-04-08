@@ -89,3 +89,51 @@ def test_digit_leading_field_key_stored_without_backticks(tmp_path, monkeypatch)
         assert data["items"][field_id] == {"value": 42}
     finally:
         running.stop()
+
+
+def test_write_streaming_rpc(tmp_path, monkeypatch):
+    """Write bidirectional streaming RPC applies writes and returns WriteResponse."""
+    import grpc
+    from google.cloud.firestore_v1.types import document as document_pb
+    from google.cloud.firestore_v1.types import firestore as firestore_pb
+    from google.cloud.firestore_v1.types import write as write_pb
+    from google.cloud.firestore_v1 import _helpers
+
+    running = start_grpc_emulator(tmp_path, host="127.0.0.1", port=0)
+    try:
+        channel = grpc.insecure_channel(f"{running.host}:{running.port}")
+
+        method = channel.stream_stream(
+            "/google.firestore.v1.Firestore/Write",
+            request_serializer=firestore_pb.WriteRequest.serialize,
+            response_deserializer=firestore_pb.WriteResponse.deserialize,
+        )
+
+        doc_name = "projects/demo-project/databases/(default)/documents/things/w1"
+        doc = document_pb.Document(
+            name=doc_name,
+            fields=_helpers.encode_dict({"x": 99}),
+        )
+        write = write_pb.Write(update=doc)
+        requests = [
+            firestore_pb.WriteRequest(
+                database="projects/demo-project/databases/(default)",
+                writes=[write],
+            )
+        ]
+
+        responses = list(method(iter(requests)))
+        assert len(responses) == 1
+        resp = responses[0]
+        assert resp.stream_id
+        assert len(resp.write_results) == 1
+        assert resp.commit_time is not None
+
+        # Verify the write was persisted
+        monkeypatch.setenv("FIRESTORE_EMULATOR_HOST", f"{running.host}:{running.port}")
+        client = firestore.Client(project="demo-project")
+        snap = client.collection("things").document("w1").get()
+        assert snap.exists
+        assert snap.to_dict() == {"x": 99}
+    finally:
+        running.stop()

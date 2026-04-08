@@ -7,6 +7,7 @@ from math import sqrt
 from pathlib import Path
 import re
 from typing import Any, Iterable
+from uuid import uuid4
 
 import grpc
 from google.cloud.firestore_v1 import _helpers
@@ -161,6 +162,42 @@ class FirestoreEmulatorService:
 
         return firestore_pb.CommitResponse(write_results=results, commit_time=commit_time)
 
+    def Write(
+        self,
+        request_iterator: Iterable[firestore_pb.WriteRequest],
+        context: grpc.ServicerContext,
+    ) -> Iterable[firestore_pb.WriteResponse]:
+        stream_id = uuid4().hex
+        stream_token = stream_id.encode()
+
+        for request in request_iterator:
+            commit_time = _now_timestamp()
+            results: list[write_pb.WriteResult] = []
+
+            for operation in request.writes:
+                op_kind = operation._pb.WhichOneof("operation")
+
+                if op_kind == "update":
+                    self._apply_update_write(operation, context)
+                elif op_kind == "delete":
+                    self._apply_delete_write(operation, context)
+                elif op_kind == "transform":
+                    self._apply_transform_write(operation, context)
+                else:
+                    context.abort(
+                        grpc.StatusCode.UNIMPLEMENTED,
+                        f"Unsupported write operation: {op_kind}",
+                    )
+
+                results.append(write_pb.WriteResult(update_time=commit_time))
+
+            yield firestore_pb.WriteResponse(
+                stream_id=stream_id,
+                stream_token=stream_token,
+                write_results=results,
+                commit_time=commit_time,
+            )
+
     def RunQuery(
         self, request: firestore_pb.RunQueryRequest, context: grpc.ServicerContext
     ) -> Iterable[firestore_pb.RunQueryResponse]:
@@ -298,6 +335,11 @@ def start_grpc_emulator(
             service.Commit,
             request_deserializer=firestore_pb.CommitRequest.deserialize,
             response_serializer=firestore_pb.CommitResponse.serialize,
+        ),
+        "Write": grpc.stream_stream_rpc_method_handler(
+            service.Write,
+            request_deserializer=firestore_pb.WriteRequest.deserialize,
+            response_serializer=firestore_pb.WriteResponse.serialize,
         ),
         "RunQuery": grpc.unary_stream_rpc_method_handler(
             service.RunQuery,

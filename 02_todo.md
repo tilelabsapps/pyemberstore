@@ -7,12 +7,12 @@ CreateDocument  ✅  (gRPC + HTTP)
 DeleteDocument  ✅  (gRPC + HTTP)
 GetDocument     ✅  (gRPC + HTTP)
 UpdateDocument  ✅  (gRPC + HTTP)
-Write           ❌  (neither gRPC nor HTTP)
+Write           ✅  (gRPC)  ❌  (HTTP)
 ```
 
 ---
 
-## 1. Missing: `Write` gRPC bidirectional streaming RPC
+## 1. ✅ Done: `Write` gRPC bidirectional streaming RPC
 
 The Firestore gRPC API exposes:
 

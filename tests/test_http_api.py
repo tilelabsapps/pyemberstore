@@ -128,3 +128,98 @@ def test_delete_document(tmp_path):
 
     get = client.get("/v1/projects/local/databases/(default)/documents/users/gone")
     assert get.status_code == 404
+
+
+def test_write_update_creates_document(tmp_path):
+    client = _client(tmp_path)
+
+    body = {
+        "writes": [
+            {
+                "update": {
+                    "name": "projects/local/databases/(default)/documents/items/item1",
+                    "fields": {"label": {"stringValue": "hello"}},
+                }
+            }
+        ]
+    }
+
+    res = client.post("/v1/projects/local/databases/(default)/documents:write", json=body)
+    assert res.status_code == 200
+    data = res.json()
+    assert "streamId" in data
+    assert "commitTime" in data
+    assert len(data["writeResults"]) == 1
+
+    get = client.get("/v1/projects/local/databases/(default)/documents/items/item1")
+    assert get.status_code == 200
+    assert get.json()["fields"]["label"] == {"stringValue": "hello"}
+
+
+def test_write_delete_removes_document(tmp_path):
+    client = _client(tmp_path)
+
+    client.post(
+        "/v1/projects/local/databases/(default)/documents/items",
+        params={"documentId": "to-delete"},
+        json={"fields": {"v": {"integerValue": "1"}}},
+    )
+
+    body = {
+        "writes": [
+            {
+                "delete": "projects/local/databases/(default)/documents/items/to-delete",
+            }
+        ]
+    }
+
+    res = client.post("/v1/projects/local/databases/(default)/documents:write", json=body)
+    assert res.status_code == 200
+    assert len(res.json()["writeResults"]) == 1
+
+    get = client.get("/v1/projects/local/databases/(default)/documents/items/to-delete")
+    assert get.status_code == 404
+
+
+def test_write_update_with_update_mask(tmp_path):
+    client = _client(tmp_path)
+
+    client.post(
+        "/v1/projects/local/databases/(default)/documents/items",
+        params={"documentId": "masked"},
+        json={"fields": {"a": {"stringValue": "keep"}, "b": {"stringValue": "old"}}},
+    )
+
+    body = {
+        "writes": [
+            {
+                "update": {
+                    "name": "projects/local/databases/(default)/documents/items/masked",
+                    "fields": {"b": {"stringValue": "new"}},
+                },
+                "updateMask": {"fieldPaths": ["b"]},
+            }
+        ]
+    }
+
+    res = client.post("/v1/projects/local/databases/(default)/documents:write", json=body)
+    assert res.status_code == 200
+
+    get = client.get("/v1/projects/local/databases/(default)/documents/items/masked")
+    fields = get.json()["fields"]
+    assert fields["a"] == {"stringValue": "keep"}
+    assert fields["b"] == {"stringValue": "new"}
+
+
+def test_write_empty_writes(tmp_path):
+    client = _client(tmp_path)
+
+    res = client.post(
+        "/v1/projects/local/databases/(default)/documents:write",
+        json={"writes": []},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["writeResults"] == []
+    assert "streamId" in data
+    assert "commitTime" in data

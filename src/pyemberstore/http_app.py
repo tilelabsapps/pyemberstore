@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -69,6 +70,50 @@ def create_app(storage_root: str | Path) -> FastAPI:
         ]
         return {"documents": docs}
 
+    @app.post("/v1/projects/{project}/databases/{database}/documents:write")
+    def write_documents(
+        project: str,
+        database: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        writes = body.get("writes", [])
+        stream_id = uuid4().hex
+        commit_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        write_results: list[dict[str, Any]] = []
+
+        client = _client_for(project, database)
+
+        for write_op in writes:
+            if "update" in write_op:
+                doc = write_op["update"]
+                collection_path, doc_id = _parse_doc_path(doc["name"])
+                data = _decode_document_body(doc)
+                update_mask = write_op.get("updateMask")
+                ref = client.collection(collection_path).document(doc_id)
+
+                if update_mask and update_mask.get("fieldPaths"):
+                    existing = ref.get().to_dict() or {}
+                    merged = _apply_update_mask(existing, data, update_mask["fieldPaths"])
+                    ref.set(merged)
+                else:
+                    ref.set(data)
+
+            elif "delete" in write_op:
+                collection_path, doc_id = _parse_doc_path(write_op["delete"])
+                client.collection(collection_path).document(doc_id).delete()
+
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported write operation")
+
+            write_results.append({"updateTime": commit_time})
+
+        return {
+            "streamId": stream_id,
+            "streamToken": stream_id,
+            "writeResults": write_results,
+            "commitTime": commit_time,
+        }
+
     @app.post("/v1/projects/{project}/databases/{database}/documents:runQuery")
     def run_query(project: str, database: str, body: dict[str, Any]) -> list[dict[str, Any]]:
         structured = body.get("structuredQuery") or {}
@@ -101,6 +146,59 @@ def create_app(storage_root: str | Path) -> FastAPI:
         ]
 
     return app
+
+
+def _parse_doc_path(doc_name: str) -> tuple[str, str]:
+    """Extract (collection_path, doc_id) from a Firestore document resource name."""
+    marker = "/documents/"
+    idx = doc_name.find(marker)
+    if idx == -1:
+        raise HTTPException(status_code=400, detail=f"Invalid document name: {doc_name!r}")
+    rest = doc_name[idx + len(marker):]
+    parts = rest.split("/")
+    if len(parts) < 2 or len(parts) % 2 != 0:
+        raise HTTPException(status_code=400, detail=f"Invalid document path in: {doc_name!r}")
+    return "/".join(parts[:-1]), parts[-1]
+
+
+def _apply_update_mask(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+    field_paths: list[str],
+) -> dict[str, Any]:
+    """Apply a list of dot-separated field paths as a merge mask."""
+    merged = dict(existing)
+    for path in field_paths:
+        parts = path.split(".")
+        # Look up value in incoming
+        src: Any = incoming
+        found = True
+        for part in parts:
+            if not isinstance(src, dict) or part not in src:
+                found = False
+                break
+            src = src[part]
+
+        if found:
+            dst = merged
+            for part in parts[:-1]:
+                node = dst.get(part)
+                if not isinstance(node, dict):
+                    node = {}
+                    dst[part] = node
+                dst = node
+            dst[parts[-1]] = src
+        else:
+            dst = merged
+            for part in parts[:-1]:
+                if not isinstance(dst, dict) or part not in dst:
+                    dst = None
+                    break
+                dst = dst[part]
+            if isinstance(dst, dict):
+                dst.pop(parts[-1], None)
+
+    return merged
 
 
 def _decode_document_body(body: dict[str, Any]) -> dict[str, Any]:

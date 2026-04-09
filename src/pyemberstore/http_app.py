@@ -11,7 +11,7 @@ from .client import Client
 
 
 def create_app(storage_root: str | Path) -> FastAPI:
-    app = FastAPI(title="Pyember Store", version="0.1.0")
+    app = FastAPI(title="Pyember Store", version="0.2.0")
     root = Path(storage_root)
 
     def _client_for(project: str, database: str) -> Client:
@@ -46,10 +46,15 @@ def create_app(storage_root: str | Path) -> FastAPI:
         collection_id: str,
         document_id: str,
         body: dict[str, Any],
+        update_mask_field_paths: list[str] | None = Query(default=None, alias="updateMask.fieldPaths"),
     ) -> dict[str, Any]:
         ref = _client_for(project, database).collection(collection_id).document(document_id)
         data = _decode_document_body(body)
-        if ref.get().exists:
+        if update_mask_field_paths:
+            existing = ref.get().to_dict() or {}
+            merged = _apply_update_mask(existing, data, update_mask_field_paths)
+            ref.set(merged)
+        elif ref.get().exists:
             ref.set(data, merge=True)
         else:
             ref.set(data)

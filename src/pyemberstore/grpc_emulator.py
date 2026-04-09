@@ -76,9 +76,7 @@ class FirestoreEmulatorService:
         project, database, parent_doc_path = _parse_parent(request.parent)
         collection_path = _collection_from_parent(parent_doc_path, request.collection_id)
 
-        doc_id = request.document_id
-        if not doc_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "document_id is required")
+        doc_id = request.document_id or uuid4().hex
 
         doc_name = _build_document_name(project, database, collection_path, doc_id)
         ref = self._client(project, database).collection(collection_path).document(doc_id)

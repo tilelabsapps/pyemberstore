@@ -7,7 +7,7 @@ CreateDocument  ✅  (gRPC + HTTP)
 DeleteDocument  ✅  (gRPC + HTTP)
 GetDocument     ✅  (gRPC + HTTP)
 UpdateDocument  ✅  (gRPC + HTTP)
-Write           ✅  (gRPC)  ❌  (HTTP)
+Write           ✅  (gRPC)  ✅  (HTTP)
 ```
 
 ---
@@ -33,7 +33,7 @@ and stream back a `WriteResponse` with `write_results` and `commit_time`.
 
 ---
 
-## 2. Missing: `Write` HTTP REST endpoint
+## 2. ✅ Done: `Write` HTTP REST endpoint
 
 The Firestore REST API v1 exposes:
 
@@ -48,7 +48,7 @@ This endpoint does **not exist** in `http_app.py`.
 
 ---
 
-## 3. Partial: `CreateDocument` in gRPC does not auto-generate document IDs
+## 3. ✅ Done: `CreateDocument` in gRPC does not auto-generate document IDs
 
 In `grpc_emulator.py` the handler aborts with `INVALID_ARGUMENT` when `document_id` is
 empty:
@@ -64,7 +64,7 @@ random one. The HTTP handler (`http_app.py`) already handles this correctly with
 
 ---
 
-## 4. Partial: `UpdateDocument` HTTP endpoint ignores `updateMask`
+## 4. ✅ Done: `UpdateDocument` HTTP endpoint ignores `updateMask`
 
 The Firestore REST `PATCH` endpoint accepts `?updateMask.fieldPaths=field1&...` query
 parameters to do a field-level merge. The current `patch_document` handler in `http_app.py`
@@ -73,7 +73,7 @@ The gRPC `UpdateDocument` already handles `update_mask` correctly.
 
 ---
 
-## 5. Minor: `grpcio` is not an explicit dependency
+## 5. ✅ Done: `grpcio` is not an explicit dependency
 
 `grpcio` is available as a transitive dependency of `google-cloud-firestore`, but it is
 not listed in `pyproject.toml`. Any caller that imports `grpc` directly
@@ -89,7 +89,7 @@ dependencies = [
 
 ---
 
-## 6. Minor: version is still `0.1.0`
+## 6. ✅ Done: version is still `0.1.0`
 
 `pyproject.toml` still reads `version = "0.1.0"`. Once the items above are resolved,
 bump to `0.2.0`.

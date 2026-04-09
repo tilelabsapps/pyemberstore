@@ -1,6 +1,6 @@
 [project]
 name = "pyemberstore"
-version = "0.1.0"
+version = "0.2.0"
 description = "Firestore-compatible local JSON store for Python development and testing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -8,6 +8,7 @@ dependencies = [
   "google-cloud-firestore>=2.21.0",
   "fastapi>=0.116.0",
   "uvicorn>=0.35.0",
+  "grpcio>=1.78.0",
 ]
 
 [dependency-groups]

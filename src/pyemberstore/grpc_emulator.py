@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from concurrent import futures
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -324,7 +325,7 @@ class FirestoreEmulatorService:
                     preserve_missing_paths=transform_paths,
                 )
             elif not incoming and operation.update_transforms:
-                result = dict(existing_data)
+                result = copy.deepcopy(existing_data)
 
             if operation.update_transforms:
                 for transform in operation.update_transforms:
@@ -342,7 +343,7 @@ class FirestoreEmulatorService:
             exists = existing is not None
             _check_precondition(operation.current_document, exists, context)
 
-            current = dict(existing or {})
+            current = copy.deepcopy(existing or {})
             for field_transform in transform.field_transforms:
                 _apply_field_transform(current, field_transform, now, context)
             docs[doc_id] = current

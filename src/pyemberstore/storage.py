@@ -31,43 +31,30 @@ class JSONStorage:
         return self._local.active_locks
 
     def lock(self, name: str, exclusive: bool = True):
-        """Return a context manager for locking the collection."""
+        """Return a context manager for locking the collection.
+        
+        Note: We always use exclusive locks to avoid deadlocks and complex 
+        lock upgrade scenarios in this local JSON emulator.
+        """
         storage = self
         class LockContext:
             def __enter__(self):
                 active = storage._get_active_locks()
-                self.lock_obj = None
-                
-                # If we already have a lock of sufficient or higher level, just increment/track
                 if name in active:
-                    already_exclusive = active[name]
-                    if already_exclusive or not exclusive:
-                        # Already have EX, or already have SH and only need SH
-                        self.needs_unlock = False
-                        return
-                    
-                    # Lock upgrade case: we have SH but need EX.
-                    # portalocker.Lock is not reentrant for upgrades on the same file handle usually.
-                    # We'll acquire a NEW lock object for the upgrade.
+                    self.nested = True
+                    return
                 
+                self.nested = False
                 lock_path = storage._collection_path(name).with_suffix(".lock")
-                flags = portalocker.LOCK_EX if exclusive else portalocker.LOCK_SH
-                self.lock_obj = portalocker.Lock(lock_path, flags=flags, mode="a", timeout=60)
+                # Always use LOCK_EX for simplicity and safety against deadlocks
+                self.lock_obj = portalocker.Lock(lock_path, flags=portalocker.LOCK_EX, mode="a", timeout=60)
                 self.lock_obj.__enter__()
-                self.needs_unlock = True
-                
-                # Track the new level. If we had SH and got EX, we now have EX.
-                self.prev_level = active.get(name)
-                active[name] = exclusive or self.prev_level
+                active[name] = True
 
             def __exit__(self, exc_type, exc_val, exc_tb):
-                if self.needs_unlock:
+                if not self.nested:
                     self.lock_obj.__exit__(exc_type, exc_val, exc_tb)
-                    active = storage._get_active_locks()
-                    if self.prev_level is None:
-                        del active[name]
-                    else:
-                        active[name] = self.prev_level
+                    del storage._get_active_locks()[name]
         
         return LockContext()
 

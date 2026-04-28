@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from math import sqrt
 from pathlib import Path
 import re
+import threading
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -49,23 +50,26 @@ class FirestoreEmulatorService:
         self._storage_root = Path(storage_root)
         self._storage_root.mkdir(parents=True, exist_ok=True)
         self._active_transactions: dict[bytes, datetime] = {}
+        self._txn_lock = threading.Lock()
 
     def _prune_stale_transactions(self) -> None:
         now = datetime.now(UTC)
-        stale = [
-            tid for tid, start_time in self._active_transactions.items()
-            if (now - start_time).total_seconds() > TRANSACTION_TTL_SECONDS
-        ]
-        for tid in stale:
-            del self._active_transactions[tid]
+        with self._txn_lock:
+            stale = [
+                tid for tid, start_time in self._active_transactions.items()
+                if (now - start_time).total_seconds() > TRANSACTION_TTL_SECONDS
+            ]
+            for tid in stale:
+                del self._active_transactions[tid]
 
     def GetDocument(
         self, request: firestore_pb.GetDocumentRequest, context: grpc.ServicerContext
     ) -> document_pb.Document:
         if request.transaction:
             self._prune_stale_transactions()
-            if request.transaction not in self._active_transactions:
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+            with self._txn_lock:
+                if request.transaction not in self._active_transactions:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
 
         project, database, collection_path, doc_id = _parse_document_name(request.name)
         ref = self._client(project, database).collection(collection_path).document(doc_id)
@@ -164,8 +168,9 @@ class FirestoreEmulatorService:
         _parse_database(request.database)
         if request.transaction:
             self._prune_stale_transactions()
-            if request.transaction not in self._active_transactions:
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+            with self._txn_lock:
+                if request.transaction not in self._active_transactions:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
 
         read_time = _now_timestamp()
 
@@ -186,7 +191,8 @@ class FirestoreEmulatorService:
         _parse_database(request.database)
         self._prune_stale_transactions()
         transaction_id = uuid4().bytes
-        self._active_transactions[transaction_id] = datetime.now(UTC)
+        with self._txn_lock:
+            self._active_transactions[transaction_id] = datetime.now(UTC)
         return firestore_pb.BeginTransactionResponse(transaction=transaction_id)
 
     def Rollback(
@@ -194,7 +200,8 @@ class FirestoreEmulatorService:
     ) -> empty_pb2.Empty:
         _parse_database(request.database)
         self._prune_stale_transactions()
-        self._active_transactions.pop(request.transaction, None)
+        with self._txn_lock:
+            self._active_transactions.pop(request.transaction, None)
         return empty_pb2.Empty()
 
     def Commit(
@@ -207,14 +214,16 @@ class FirestoreEmulatorService:
 
         self._prune_stale_transactions()
         if request.transaction:
-            if request.transaction not in self._active_transactions:
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
-            self._active_transactions.pop(request.transaction, None)
+            with self._txn_lock:
+                if request.transaction not in self._active_transactions:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+                self._active_transactions.pop(request.transaction, None)
 
         # 1. Identify all affected collections
         affected_cols: set[str] = set()
         for op in request.writes:
-            _, _, collection_path, _ = _parse_document_name(_get_doc_name(op))
+            name = _get_doc_name_safe(op, context)
+            _, _, collection_path, _ = _parse_document_name(name)
             affected_cols.add(collection_path)
 
         sorted_cols = sorted(list(affected_cols))
@@ -257,7 +266,8 @@ class FirestoreEmulatorService:
             # Group and apply atomically per WriteRequest
             affected_cols: set[str] = set()
             for op in request.writes:
-                _, _, collection_path, _ = _parse_document_name(_get_doc_name(op))
+                name = _get_doc_name_safe(op, context)
+                _, _, collection_path, _ = _parse_document_name(name)
                 affected_cols.add(collection_path)
 
             sorted_cols = sorted(list(affected_cols))
@@ -292,7 +302,7 @@ class FirestoreEmulatorService:
         now: datetime,
     ) -> None:
         op_kind = operation._pb.WhichOneof("operation")
-        _, _, collection_path, doc_id = _parse_document_name(_get_doc_name(operation))
+        _, _, collection_path, doc_id = _parse_document_name(_get_doc_name_safe(operation, context))
         docs = docs_cache[collection_path]
 
         if op_kind == "update":
@@ -347,8 +357,9 @@ class FirestoreEmulatorService:
     ) -> Iterable[firestore_pb.RunQueryResponse]:
         if request.transaction:
             self._prune_stale_transactions()
-            if request.transaction not in self._active_transactions:
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+            with self._txn_lock:
+                if request.transaction not in self._active_transactions:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
 
         project, database, parent_doc_path = _parse_parent(request.parent)
         structured = request.structured_query
@@ -805,7 +816,7 @@ def _unwrap_scalar(value: Any) -> Any:
         return value.value
     return value
 
-def _get_doc_name(operation: write_pb.Write) -> str:
+def _get_doc_name_safe(operation: write_pb.Write, context: grpc.ServicerContext) -> str:
     op_kind = operation._pb.WhichOneof("operation")
     if op_kind == "update":
         return operation.update.name
@@ -813,4 +824,8 @@ def _get_doc_name(operation: write_pb.Write) -> str:
         return operation.delete
     if op_kind == "transform":
         return operation.transform.document
-    raise ValueError(f"Unknown operation kind: {op_kind}")
+    
+    context.abort(
+        grpc.StatusCode.INVALID_ARGUMENT,
+        f"Unknown or missing write operation: {op_kind}",
+    )

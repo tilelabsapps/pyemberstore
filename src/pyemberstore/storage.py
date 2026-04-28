@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from google.cloud.firestore_v1.vector import Vector
 
@@ -25,7 +28,13 @@ class JSONStorage:
             return {}
 
         with path.open("r", encoding="utf-8") as f:
-            payload = json.load(f)
+            try:
+                # Apply a shared lock for reading
+                fcntl.flock(f, fcntl.LOCK_SH)
+                payload = json.load(f)
+            finally:
+                # Release the lock
+                fcntl.flock(f, fcntl.LOCK_UN)
 
         if not isinstance(payload, dict):
             raise ValueError(f"Collection file {path} must contain a JSON object")
@@ -36,9 +45,23 @@ class JSONStorage:
         path = self._collection_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(_encode_special_values(documents), f, indent=2, sort_keys=True)
-            f.write("\n")
+        # Write to a temporary file first to ensure atomicity
+        tmp_path = path.with_suffix(f".{uuid4().hex}.tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                # Apply an exclusive lock on the temp file (though not strictly necessary)
+                fcntl.flock(f, fcntl.LOCK_EX)
+                json.dump(_encode_special_values(documents), f, indent=2, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+            # Atomic rename to target path
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def _collection_path(self, name: str) -> Path:
         return self._root / f"{name}.json"
@@ -52,7 +75,7 @@ _VECTOR_TYPE = "vector"
 
 def _encode_special_values(value: Any) -> Any:
     if isinstance(value, datetime):
-        return {_TYPE_KEY: _TIMESTAMP_TYPE, _VALUE_KEY: value.isoformat()}
+        return value.isoformat()
     if isinstance(value, Vector):
         return {_TYPE_KEY: _VECTOR_TYPE, _VALUE_KEY: [float(v) for v in value]}
 
@@ -75,5 +98,13 @@ def _decode_special_values(value: Any) -> Any:
 
     if isinstance(value, list):
         return [_decode_special_values(v) for v in value]
+
+    if isinstance(value, str):
+        # Heuristic: if it looks like an ISO timestamp, try to decode it
+        if len(value) >= 19 and value[4] == "-" and value[7] == "-" and "T" in value:
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return value
 
     return value

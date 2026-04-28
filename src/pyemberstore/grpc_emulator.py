@@ -44,10 +44,15 @@ class FirestoreEmulatorService:
     def __init__(self, storage_root: str | Path) -> None:
         self._storage_root = Path(storage_root)
         self._storage_root.mkdir(parents=True, exist_ok=True)
+        self._active_transactions: dict[bytes, datetime] = {}
 
     def GetDocument(
         self, request: firestore_pb.GetDocumentRequest, context: grpc.ServicerContext
     ) -> document_pb.Document:
+        if request.transaction:
+            if request.transaction not in self._active_transactions:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+
         project, database, collection_path, doc_id = _parse_document_name(request.name)
         ref = self._client(project, database).collection(collection_path).document(doc_id)
         snap = ref.get()
@@ -121,6 +126,10 @@ class FirestoreEmulatorService:
         self, request: firestore_pb.BatchGetDocumentsRequest, context: grpc.ServicerContext
     ) -> Iterable[firestore_pb.BatchGetDocumentsResponse]:
         _parse_database(request.database)
+        if request.transaction:
+            if request.transaction not in self._active_transactions:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+
         read_time = _now_timestamp()
 
         for name in request.documents:
@@ -134,12 +143,32 @@ class FirestoreEmulatorService:
             else:
                 yield firestore_pb.BatchGetDocumentsResponse(missing=name, read_time=read_time)
 
+    def BeginTransaction(
+        self, request: firestore_pb.BeginTransactionRequest, context: grpc.ServicerContext
+    ) -> firestore_pb.BeginTransactionResponse:
+        _parse_database(request.database)
+        transaction_id = uuid4().bytes
+        self._active_transactions[transaction_id] = datetime.now(UTC)
+        return firestore_pb.BeginTransactionResponse(transaction=transaction_id)
+
+    def Rollback(
+        self, request: firestore_pb.RollbackRequest, context: grpc.ServicerContext
+    ) -> empty_pb2.Empty:
+        _parse_database(request.database)
+        self._active_transactions.pop(request.transaction, None)
+        return empty_pb2.Empty()
+
     def Commit(
         self, request: firestore_pb.CommitRequest, context: grpc.ServicerContext
     ) -> firestore_pb.CommitResponse:
         _parse_database(request.database)
         commit_time = _now_timestamp()
         results: list[write_pb.WriteResult] = []
+
+        if request.transaction:
+            if request.transaction not in self._active_transactions:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+            self._active_transactions.pop(request.transaction, None)
 
         for operation in request.writes:
             op_kind = operation._pb.WhichOneof("operation")
@@ -199,6 +228,10 @@ class FirestoreEmulatorService:
     def RunQuery(
         self, request: firestore_pb.RunQueryRequest, context: grpc.ServicerContext
     ) -> Iterable[firestore_pb.RunQueryResponse]:
+        if request.transaction:
+            if request.transaction not in self._active_transactions:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+
         project, database, parent_doc_path = _parse_parent(request.parent)
         structured = request.structured_query
 
@@ -328,6 +361,16 @@ def start_grpc_emulator(
             service.BatchGetDocuments,
             request_deserializer=firestore_pb.BatchGetDocumentsRequest.deserialize,
             response_serializer=firestore_pb.BatchGetDocumentsResponse.serialize,
+        ),
+        "BeginTransaction": grpc.unary_unary_rpc_method_handler(
+            service.BeginTransaction,
+            request_deserializer=firestore_pb.BeginTransactionRequest.deserialize,
+            response_serializer=firestore_pb.BeginTransactionResponse.serialize,
+        ),
+        "Rollback": grpc.unary_unary_rpc_method_handler(
+            service.Rollback,
+            request_deserializer=firestore_pb.RollbackRequest.deserialize,
+            response_serializer=empty_pb2.Empty.SerializeToString,
         ),
         "Commit": grpc.unary_unary_rpc_method_handler(
             service.Commit,

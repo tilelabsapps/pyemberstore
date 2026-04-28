@@ -74,7 +74,8 @@ def test_server_timestamp(tmp_path):
                 data = json.load(f)
                 ts_entry = data["ts_doc"]["ts"]
                 print(f"Stored TS entry: {ts_entry}")
-                # Currently it is expected to be a dict with __pyember_type__
+                assert ts_entry["__pyember_type__"] == "timestamp"
+                assert "value" in ts_entry
                 
         finally:
             emulator.stop()

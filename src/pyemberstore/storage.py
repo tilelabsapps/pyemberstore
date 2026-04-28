@@ -98,7 +98,7 @@ _VECTOR_TYPE = "vector"
 
 def _encode_special_values(value: Any) -> Any:
     if isinstance(value, datetime):
-        return value.isoformat()
+        return {_TYPE_KEY: _TIMESTAMP_TYPE, _VALUE_KEY: value.isoformat()}
     if isinstance(value, Vector):
         return {_TYPE_KEY: _VECTOR_TYPE, _VALUE_KEY: [float(v) for v in value]}
 
@@ -121,13 +121,5 @@ def _decode_special_values(value: Any) -> Any:
 
     if isinstance(value, list):
         return [_decode_special_values(v) for v in value]
-
-    if isinstance(value, str):
-        # Heuristic: if it looks like an ISO timestamp, try to decode it
-        if len(value) >= 19 and value[4] == "-" and value[7] == "-" and "T" in value:
-            try:
-                return datetime.fromisoformat(value)
-            except ValueError:
-                return value
 
     return value

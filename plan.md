@@ -14,8 +14,8 @@ through them.
 - UpdateDocument: (UpdateDocumentRequest) -> Document
 - Write: (WriteRequest) -> WriteResponse
 - **Atomic File Operations**: Use a temporary file and `os.replace` for atomic writes.
-- **File Locking**: Implement `fcntl` locking mechanism for concurrent safety.
-- **ISO Timestamps**: Store `SERVER_TIMESTAMP` as plain ISO datetime strings.
+- **File Locking**: Implement cross-platform file locking for concurrent safety.
+- **ISO Timestamps**: Store `SERVER_TIMESTAMP` as ISO datetime strings with explicit type tagging.
 
 ## 0.3 (TODO)
 

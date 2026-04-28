@@ -59,10 +59,8 @@ def test_server_timestamp_transform_roundtrip(tmp_path, monkeypatch):
         persisted = json.loads(
             (tmp_path / "demo-project" / "(default)" / "events.json").read_text()
         )
-        # Verify it is expanded to a valid ISO datetime string in the stored JSON
-        assert isinstance(persisted["e1"]["ts"], str)
-        # And it can be parsed back
-        datetime.fromisoformat(persisted["e1"]["ts"])
+        assert persisted["e1"]["ts"]["__pyember_type__"] == "timestamp"
+        assert isinstance(persisted["e1"]["ts"]["value"], str)
     finally:
         running.stop()
 

@@ -14,7 +14,7 @@ The current Firestore emulator implementation lacks transaction support, causing
 High-concurrency tests currently trigger `json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)`.
 
 - [x] **Atomic File Operations**: Use a temporary file and `os.replace` (atomic rename) when writing JSON to prevent reading partially written or empty files.
-- [x] **File Locking**: Implement `fcntl` locking mechanism to prevent simultaneous reads/writes to the same collection files during emulation.
+- [x] **File Locking**: Implement cross-platform file locking (using `portalocker`) to prevent simultaneous reads/writes to the same collection files during emulation.
 
 ## 3. Implementation Consistency
-- [x] **SERVER_TIMESTAMP Support**: Ensure `SERVER_TIMESTAMP` sent via transactions/batches is correctly expanded to a valid ISO datetime string in the stored JSON.
+- [x] **SERVER_TIMESTAMP Support**: Ensure `SERVER_TIMESTAMP` sent via transactions/batches is correctly expanded to a valid ISO datetime string in the stored JSON using explicit type tagging (e.g., `{"__pyember_type__": "timestamp", "value": "..."}`).

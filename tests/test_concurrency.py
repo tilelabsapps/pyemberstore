@@ -9,9 +9,10 @@ def test_concurrent_writes(tmp_path):
     
     def writer(id):
         for i in range(100):
-            docs = storage.read_collection(collection)
-            docs[f"doc_{id}_{i}"] = {"val": i}
-            storage.write_collection(collection, docs)
+            with storage.lock(collection, exclusive=True):
+                docs = storage.read_collection(collection)
+                docs[f"doc_{id}_{i}"] = {"val": i}
+                storage.write_collection(collection, docs)
             
     threads = []
     for i in range(5):
@@ -23,11 +24,8 @@ def test_concurrent_writes(tmp_path):
         t.join()
         
     docs = storage.read_collection(collection)
-    # Total docs should be 500 if no data was lost, 
-    # but since they read-modify-write without locking, 
-    # we expect data loss BUT NOT JSONDecodeError if we use atomic replace.
-    # To trigger JSONDecodeError we need to read while another is writing non-atomically.
-    print(f"Total docs: {len(docs)}")
+    # Total docs should be 500 because we now have proper locking across read-modify-write.
+    assert len(docs) == 500
 
 def test_concurrent_read_write(tmp_path):
     storage = JSONStorage(tmp_path)

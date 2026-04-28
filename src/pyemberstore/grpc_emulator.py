@@ -41,16 +41,29 @@ class RunningGrpcEmulator:
         self.server.stop(grace)
 
 
+TRANSACTION_TTL_SECONDS = 300
+
+
 class FirestoreEmulatorService:
     def __init__(self, storage_root: str | Path) -> None:
         self._storage_root = Path(storage_root)
         self._storage_root.mkdir(parents=True, exist_ok=True)
         self._active_transactions: dict[bytes, datetime] = {}
 
+    def _prune_stale_transactions(self) -> None:
+        now = datetime.now(UTC)
+        stale = [
+            tid for tid, start_time in self._active_transactions.items()
+            if (now - start_time).total_seconds() > TRANSACTION_TTL_SECONDS
+        ]
+        for tid in stale:
+            del self._active_transactions[tid]
+
     def GetDocument(
         self, request: firestore_pb.GetDocumentRequest, context: grpc.ServicerContext
     ) -> document_pb.Document:
         if request.transaction:
+            self._prune_stale_transactions()
             if request.transaction not in self._active_transactions:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
 
@@ -150,6 +163,7 @@ class FirestoreEmulatorService:
     ) -> Iterable[firestore_pb.BatchGetDocumentsResponse]:
         _parse_database(request.database)
         if request.transaction:
+            self._prune_stale_transactions()
             if request.transaction not in self._active_transactions:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
 
@@ -170,6 +184,7 @@ class FirestoreEmulatorService:
         self, request: firestore_pb.BeginTransactionRequest, context: grpc.ServicerContext
     ) -> firestore_pb.BeginTransactionResponse:
         _parse_database(request.database)
+        self._prune_stale_transactions()
         transaction_id = uuid4().bytes
         self._active_transactions[transaction_id] = datetime.now(UTC)
         return firestore_pb.BeginTransactionResponse(transaction=transaction_id)
@@ -178,6 +193,7 @@ class FirestoreEmulatorService:
         self, request: firestore_pb.RollbackRequest, context: grpc.ServicerContext
     ) -> empty_pb2.Empty:
         _parse_database(request.database)
+        self._prune_stale_transactions()
         self._active_transactions.pop(request.transaction, None)
         return empty_pb2.Empty()
 
@@ -189,6 +205,7 @@ class FirestoreEmulatorService:
         now = datetime.now(UTC)
         results: list[write_pb.WriteResult] = []
 
+        self._prune_stale_transactions()
         if request.transaction:
             if request.transaction not in self._active_transactions:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
@@ -329,6 +346,7 @@ class FirestoreEmulatorService:
         self, request: firestore_pb.RunQueryRequest, context: grpc.ServicerContext
     ) -> Iterable[firestore_pb.RunQueryResponse]:
         if request.transaction:
+            self._prune_stale_transactions()
             if request.transaction not in self._active_transactions:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
 

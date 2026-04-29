@@ -540,7 +540,7 @@ def _apply_update_mask(
     field_paths: Iterable[str],
     preserve_missing_paths: set[str] | None = None,
 ) -> dict[str, Any]:
-    merged = dict(existing)
+    merged = copy.deepcopy(existing)
     preserve_missing_paths = preserve_missing_paths or set()
 
     for path in field_paths:

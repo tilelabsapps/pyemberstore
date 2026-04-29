@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 from contextlib import ExitStack
 from pathlib import Path
@@ -197,7 +198,7 @@ def _apply_update_mask(
     field_paths: list[str],
 ) -> dict[str, Any]:
     """Apply a list of dot-separated field paths as a merge mask."""
-    merged = dict(existing)
+    merged = copy.deepcopy(existing)
     for path in field_paths:
         parts = path.split(".")
         # Look up value in incoming

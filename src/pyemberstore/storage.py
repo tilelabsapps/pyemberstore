@@ -47,7 +47,7 @@ class JSONStorage:
                 self.nested = False
                 lock_path = storage._collection_path(name).with_suffix(".lock")
                 # Always use LOCK_EX for simplicity and safety against deadlocks
-                self.lock_obj = portalocker.Lock(lock_path, flags=portalocker.LOCK_EX, mode="a", timeout=60)
+                self.lock_obj = portalocker.Lock(lock_path, flags=portalocker.LOCK_EX, mode="w", timeout=60)
                 self.lock_obj.__enter__()
                 active[name] = True
 

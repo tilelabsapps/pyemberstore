@@ -63,7 +63,7 @@ class JSONStorage:
         if not path.exists():
             return {}
 
-        with self.lock(name, exclusive=False):
+        with self.lock(name, exclusive=True):
             with path.open("r", encoding="utf-8") as f:
                 payload = json.load(f)
 

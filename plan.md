@@ -6,13 +6,16 @@ ahve already been implemented in the initial version, but
 they may be incomplete and we want to methodologically go
 through them.
 
-## 0.2 (TODO)
+## 0.2 (DONE)
 
 - CreateDocument: (CreateDocumentRequest) -> (Document)
 - DeleteDocument: (DeleteDocumentRequest) -> Empty
 - GetDocument: (GetDocumentRequest) -> Document
 - UpdateDocument: (UpdateDocumentRequest) -> Document
 - Write: (WriteRequest) -> WriteResponse
+- **Atomic File Operations**: Use a temporary file and `os.replace` for atomic writes.
+- **File Locking**: Implement cross-platform file locking for concurrent safety.
+- **ISO Timestamps**: Store `SERVER_TIMESTAMP` as ISO datetime strings with explicit type tagging.
 
 ## 0.3 (TODO)
 
@@ -34,7 +37,7 @@ through them.
 - ExecutePipeline: (ExecutePipelineRequest) -> ExecutePipelineResponse
 - PartitionQuery: (PartitionQueryRequest) -> PartitionQueryResponse
 
-## 0.7 (TODO)
+## 0.7 (DONE)
 
 - BeginTransaction: (BeginTransactionRequest) -> BeginTransactionResponse
 - Commit: (CommitRequest) -> CommitResponse
@@ -93,7 +96,7 @@ Deep dive on:
 - PartitionQueryRequest
 - PartitionQueryResponse
 
-## 0.14 (TODO)
+## 0.14 (DONE)
 
 - BeginTransactionRequest
 - BeginTransactionResponse

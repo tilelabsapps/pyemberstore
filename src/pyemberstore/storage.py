@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+import portalocker
 from google.cloud.firestore_v1.vector import Vector
 
 
@@ -18,14 +22,77 @@ class JSONStorage:
     def __init__(self, root_path: str | Path) -> None:
         self._root = Path(root_path)
         self._root.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
+
+    def _get_lock_state(self) -> dict[str, tuple[Any, bool, int]]:
+        """Returns a dict mapping name -> (file_handle, is_exclusive, ref_count)."""
+        if not hasattr(self._local, "lock_state"):
+            self._local.lock_state = {}
+        return self._local.lock_state
+
+    def lock(self, name: str, exclusive: bool = True):
+        """Return a context manager for locking the collection.
+
+        Uses a single file handle per collection per thread to allow safe
+        lock upgrades and avoid deadlocks.
+        """
+        storage = self
+
+        class LockContext:
+            def __enter__(self):
+                state = storage._get_lock_state()
+                if name in state:
+                    f, current_exclusive, count = state[name]
+                    self.is_owner = False
+                    if exclusive and not current_exclusive:
+                        # Upgrade SH -> EX
+                        portalocker.lock(f, portalocker.LOCK_EX)
+                        state[name] = (f, True, count + 1)
+                        self.was_upgrade = True
+                    else:
+                        state[name] = (f, current_exclusive, count + 1)
+                        self.was_upgrade = False
+                    return
+
+                # First time acquisition in this thread
+                self.is_owner = True
+                self.was_upgrade = False
+                lock_path = storage._collection_path(name).with_suffix(".lock")
+                f = open(lock_path, "w")
+                portalocker.lock(f, portalocker.LOCK_EX if exclusive else portalocker.LOCK_SH)
+                state[name] = (f, exclusive, 1)
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                state = storage._get_lock_state()
+                if name not in state:
+                    return
+                f, current_exclusive, count = state[name]
+
+                if count > 1:
+                    # Nested context
+                    if self.was_upgrade:
+                        # Downgrade EX -> SH
+                        portalocker.lock(f, portalocker.LOCK_SH)
+                        state[name] = (f, False, count - 1)
+                    else:
+                        state[name] = (f, current_exclusive, count - 1)
+                    return
+
+                # Final release
+                portalocker.unlock(f)
+                f.close()
+                del state[name]
+
+        return LockContext()
 
     def read_collection(self, name: str) -> dict[str, dict[str, Any]]:
         path = self._collection_path(name)
         if not path.exists():
             return {}
 
-        with path.open("r", encoding="utf-8") as f:
-            payload = json.load(f)
+        with self.lock(name, exclusive=True):
+            with path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
 
         if not isinstance(payload, dict):
             raise ValueError(f"Collection file {path} must contain a JSON object")
@@ -36,9 +103,21 @@ class JSONStorage:
         path = self._collection_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(_encode_special_values(documents), f, indent=2, sort_keys=True)
-            f.write("\n")
+        with self.lock(name, exclusive=True):
+            # Write to a temporary file first to ensure atomicity
+            tmp_path = path.with_suffix(f".{uuid4().hex}.tmp")
+            try:
+                with tmp_path.open("w", encoding="utf-8") as f:
+                    json.dump(_encode_special_values(documents), f, indent=2, sort_keys=True)
+                    f.write("\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Atomic rename to target path
+                os.replace(tmp_path, path)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
 
     def _collection_path(self, name: str) -> Path:
         return self._root / f"{name}.json"

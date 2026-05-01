@@ -24,38 +24,65 @@ class JSONStorage:
         self._root.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
 
-    def _get_active_locks(self) -> dict[str, bool]:
-        """Returns a dict mapping collection name to is_exclusive boolean."""
-        if not hasattr(self._local, "active_locks"):
-            self._local.active_locks = {}
-        return self._local.active_locks
+    def _get_lock_state(self) -> dict[str, tuple[Any, bool, int]]:
+        """Returns a dict mapping name -> (file_handle, is_exclusive, ref_count)."""
+        if not hasattr(self._local, "lock_state"):
+            self._local.lock_state = {}
+        return self._local.lock_state
 
     def lock(self, name: str, exclusive: bool = True):
         """Return a context manager for locking the collection.
-        
-        Note: We always use exclusive locks to avoid deadlocks and complex 
-        lock upgrade scenarios in this local JSON emulator.
+
+        Uses a single file handle per collection per thread to allow safe
+        lock upgrades and avoid deadlocks.
         """
         storage = self
+
         class LockContext:
             def __enter__(self):
-                active = storage._get_active_locks()
-                if name in active:
-                    self.nested = True
+                state = storage._get_lock_state()
+                if name in state:
+                    f, current_exclusive, count = state[name]
+                    self.is_owner = False
+                    if exclusive and not current_exclusive:
+                        # Upgrade SH -> EX
+                        portalocker.lock(f, portalocker.LOCK_EX)
+                        state[name] = (f, True, count + 1)
+                        self.was_upgrade = True
+                    else:
+                        state[name] = (f, current_exclusive, count + 1)
+                        self.was_upgrade = False
                     return
-                
-                self.nested = False
+
+                # First time acquisition in this thread
+                self.is_owner = True
+                self.was_upgrade = False
                 lock_path = storage._collection_path(name).with_suffix(".lock")
-                # Always use LOCK_EX for simplicity and safety against deadlocks
-                self.lock_obj = portalocker.Lock(lock_path, flags=portalocker.LOCK_EX, mode="w", timeout=60)
-                self.lock_obj.__enter__()
-                active[name] = True
+                f = open(lock_path, "w")
+                portalocker.lock(f, portalocker.LOCK_EX if exclusive else portalocker.LOCK_SH)
+                state[name] = (f, exclusive, 1)
 
             def __exit__(self, exc_type, exc_val, exc_tb):
-                if not self.nested:
-                    self.lock_obj.__exit__(exc_type, exc_val, exc_tb)
-                    del storage._get_active_locks()[name]
-        
+                state = storage._get_lock_state()
+                if name not in state:
+                    return
+                f, current_exclusive, count = state[name]
+
+                if count > 1:
+                    # Nested context
+                    if self.was_upgrade:
+                        # Downgrade EX -> SH
+                        portalocker.lock(f, portalocker.LOCK_SH)
+                        state[name] = (f, False, count - 1)
+                    else:
+                        state[name] = (f, current_exclusive, count - 1)
+                    return
+
+                # Final release
+                portalocker.unlock(f)
+                f.close()
+                del state[name]
+
         return LockContext()
 
     def read_collection(self, name: str) -> dict[str, dict[str, Any]]:

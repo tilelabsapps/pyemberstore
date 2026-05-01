@@ -110,7 +110,7 @@ class DocumentReference:
 
             if merge and self._doc_id in docs:
                 current = docs[self._doc_id]
-                docs[self._doc_id] = {**current, **copy.deepcopy(data)}
+                docs[self._doc_id] = {**copy.deepcopy(current), **copy.deepcopy(data)}
             else:
                 docs[self._doc_id] = copy.deepcopy(data)
 
@@ -125,7 +125,7 @@ class DocumentReference:
                 )
 
             current = docs[self._doc_id]
-            docs[self._doc_id] = {**current, **copy.deepcopy(data)}
+            docs[self._doc_id] = {**copy.deepcopy(current), **copy.deepcopy(data)}
             self._storage.write_collection(self._collection_name, docs)
 
     def delete(self) -> None:

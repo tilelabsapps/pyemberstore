@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import copy
 from concurrent import futures
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import sqrt
 from pathlib import Path
 import re
+import threading
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -40,14 +43,35 @@ class RunningGrpcEmulator:
         self.server.stop(grace)
 
 
+TRANSACTION_TTL_SECONDS = 300
+
+
 class FirestoreEmulatorService:
     def __init__(self, storage_root: str | Path) -> None:
         self._storage_root = Path(storage_root)
         self._storage_root.mkdir(parents=True, exist_ok=True)
+        self._active_transactions: dict[bytes, datetime] = {}
+        self._txn_lock = threading.Lock()
+
+    def _prune_stale_transactions(self) -> None:
+        now = datetime.now(UTC)
+        with self._txn_lock:
+            stale = [
+                tid for tid, start_time in self._active_transactions.items()
+                if (now - start_time).total_seconds() > TRANSACTION_TTL_SECONDS
+            ]
+            for tid in stale:
+                del self._active_transactions[tid]
 
     def GetDocument(
         self, request: firestore_pb.GetDocumentRequest, context: grpc.ServicerContext
     ) -> document_pb.Document:
+        if request.transaction:
+            self._prune_stale_transactions()
+            with self._txn_lock:
+                if request.transaction not in self._active_transactions:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+
         project, database, collection_path, doc_id = _parse_document_name(request.name)
         ref = self._client(project, database).collection(collection_path).document(doc_id)
         snap = ref.get()
@@ -75,52 +99,80 @@ class FirestoreEmulatorService:
     ) -> document_pb.Document:
         project, database, parent_doc_path = _parse_parent(request.parent)
         collection_path = _collection_from_parent(parent_doc_path, request.collection_id)
-
         doc_id = request.document_id or uuid4().hex
-
         doc_name = _build_document_name(project, database, collection_path, doc_id)
-        ref = self._client(project, database).collection(collection_path).document(doc_id)
-        if ref.get().exists:
-            context.abort(grpc.StatusCode.ALREADY_EXISTS, "Document already exists")
 
-        data = _helpers.decode_dict(request.document.fields, client=None)
-        ref.set(data)
-        return _as_document_message(doc_name, ref.get().to_dict() or {})
+        client = self._client(project, database)
+        storage = client._storage
+        now = datetime.now(UTC)
+
+        with storage.lock(collection_path, exclusive=True):
+            docs = storage.read_collection(collection_path)
+            if doc_id in docs:
+                context.abort(grpc.StatusCode.ALREADY_EXISTS, "Document already exists")
+            
+            data = _helpers.decode_dict(request.document.fields, client=None)
+            docs[doc_id] = data
+            storage.write_collection(collection_path, docs)
+
+        return _as_document_message(doc_name, data)
 
     def UpdateDocument(
         self, request: firestore_pb.UpdateDocumentRequest, context: grpc.ServicerContext
     ) -> document_pb.Document:
         full_name = request.document.name
         project, database, collection_path, doc_id = _parse_document_name(full_name)
-        ref = self._client(project, database).collection(collection_path).document(doc_id)
+        
+        client = self._client(project, database)
+        storage = client._storage
+        now = datetime.now(UTC)
 
-        incoming = _helpers.decode_dict(request.document.fields, client=None)
-        existing = ref.get().to_dict() or {}
+        with storage.lock(collection_path, exclusive=True):
+            docs = storage.read_collection(collection_path)
+            # Create a mock Write operation to reuse logic
+            op = write_pb.Write(
+                update=request.document,
+                update_mask=request.update_mask,
+                current_document=request.current_document
+            )
+            docs_cache = {collection_path: docs}
+            self._apply_write_to_docs(op, docs_cache, context, now)
+            storage.write_collection(collection_path, docs)
+            final_data = docs[doc_id]
 
-        _check_precondition(request.current_document, ref.get().exists, context)
-
-        if request.update_mask and request.update_mask.field_paths:
-            merged = _apply_update_mask(existing, incoming, request.update_mask.field_paths)
-            ref.set(merged)
-        else:
-            ref.set(incoming)
-
-        return _as_document_message(full_name, ref.get().to_dict() or {})
+        return _as_document_message(full_name, final_data)
 
     def DeleteDocument(
         self, request: firestore_pb.DeleteDocumentRequest, context: grpc.ServicerContext
     ) -> empty_pb2.Empty:
         project, database, collection_path, doc_id = _parse_document_name(request.name)
-        ref = self._client(project, database).collection(collection_path).document(doc_id)
+        
+        client = self._client(project, database)
+        storage = client._storage
+        now = datetime.now(UTC)
 
-        _check_precondition(request.current_document, ref.get().exists, context)
-        ref.delete()
+        with storage.lock(collection_path, exclusive=True):
+            docs = storage.read_collection(collection_path)
+            op = write_pb.Write(
+                delete=request.name,
+                current_document=request.current_document
+            )
+            docs_cache = {collection_path: docs}
+            self._apply_write_to_docs(op, docs_cache, context, now)
+            storage.write_collection(collection_path, docs)
+
         return empty_pb2.Empty()
 
     def BatchGetDocuments(
         self, request: firestore_pb.BatchGetDocumentsRequest, context: grpc.ServicerContext
     ) -> Iterable[firestore_pb.BatchGetDocumentsResponse]:
         _parse_database(request.database)
+        if request.transaction:
+            self._prune_stale_transactions()
+            with self._txn_lock:
+                if request.transaction not in self._active_transactions:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+
         read_time = _now_timestamp()
 
         for name in request.documents:
@@ -134,29 +186,64 @@ class FirestoreEmulatorService:
             else:
                 yield firestore_pb.BatchGetDocumentsResponse(missing=name, read_time=read_time)
 
+    def BeginTransaction(
+        self, request: firestore_pb.BeginTransactionRequest, context: grpc.ServicerContext
+    ) -> firestore_pb.BeginTransactionResponse:
+        _parse_database(request.database)
+        self._prune_stale_transactions()
+        transaction_id = uuid4().bytes
+        with self._txn_lock:
+            self._active_transactions[transaction_id] = datetime.now(UTC)
+        return firestore_pb.BeginTransactionResponse(transaction=transaction_id)
+
+    def Rollback(
+        self, request: firestore_pb.RollbackRequest, context: grpc.ServicerContext
+    ) -> empty_pb2.Empty:
+        _parse_database(request.database)
+        self._prune_stale_transactions()
+        with self._txn_lock:
+            self._active_transactions.pop(request.transaction, None)
+        return empty_pb2.Empty()
+
     def Commit(
         self, request: firestore_pb.CommitRequest, context: grpc.ServicerContext
     ) -> firestore_pb.CommitResponse:
-        _parse_database(request.database)
+        project, database = _parse_database(request.database)
         commit_time = _now_timestamp()
+        now = datetime.now(UTC)
         results: list[write_pb.WriteResult] = []
 
-        for operation in request.writes:
-            op_kind = operation._pb.WhichOneof("operation")
+        self._prune_stale_transactions()
+        if request.transaction:
+            with self._txn_lock:
+                if request.transaction not in self._active_transactions:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+                self._active_transactions.pop(request.transaction, None)
 
-            if op_kind == "update":
-                self._apply_update_write(operation, context)
-            elif op_kind == "delete":
-                self._apply_delete_write(operation, context)
-            elif op_kind == "transform":
-                self._apply_transform_write(operation, context)
-            else:
-                context.abort(
-                    grpc.StatusCode.UNIMPLEMENTED,
-                    f"Unsupported write operation: {op_kind}",
-                )
+        # 1. Identify all affected collections
+        affected_cols: set[str] = set()
+        for op in request.writes:
+            name = _get_doc_name_safe(op, context)
+            _, _, collection_path, _ = _parse_document_name(name)
+            affected_cols.add(collection_path)
 
-            results.append(write_pb.WriteResult(update_time=commit_time))
+        sorted_cols = sorted(list(affected_cols))
+        client = self._client(project, database)
+        storage = client._storage
+
+        # 2. Lock all, read all, apply all, write all
+        with ExitStack() as stack:
+            for col in sorted_cols:
+                stack.enter_context(storage.lock(col, exclusive=True))
+
+            docs_cache = {col: storage.read_collection(col) for col in sorted_cols}
+
+            for operation in request.writes:
+                self._apply_write_to_docs(operation, docs_cache, context, now)
+                results.append(write_pb.WriteResult(update_time=commit_time))
+
+            for col in sorted_cols:
+                storage.write_collection(col, docs_cache[col])
 
         return firestore_pb.CommitResponse(write_results=results, commit_time=commit_time)
 
@@ -167,27 +254,39 @@ class FirestoreEmulatorService:
     ) -> Iterable[firestore_pb.WriteResponse]:
         stream_id = uuid4().hex
         stream_token = stream_id.encode()
+        project, database = "", ""
 
         for request in request_iterator:
+            if not project and request.database:
+                project, database = _parse_database(request.database)
+
             commit_time = _now_timestamp()
+            now = datetime.now(UTC)
             results: list[write_pb.WriteResult] = []
 
-            for operation in request.writes:
-                op_kind = operation._pb.WhichOneof("operation")
+            # Group and apply atomically per WriteRequest
+            affected_cols: set[str] = set()
+            for op in request.writes:
+                name = _get_doc_name_safe(op, context)
+                _, _, collection_path, _ = _parse_document_name(name)
+                affected_cols.add(collection_path)
 
-                if op_kind == "update":
-                    self._apply_update_write(operation, context)
-                elif op_kind == "delete":
-                    self._apply_delete_write(operation, context)
-                elif op_kind == "transform":
-                    self._apply_transform_write(operation, context)
-                else:
-                    context.abort(
-                        grpc.StatusCode.UNIMPLEMENTED,
-                        f"Unsupported write operation: {op_kind}",
-                    )
+            sorted_cols = sorted(list(affected_cols))
+            client = self._client(project or "default", database or "(default)")
+            storage = client._storage
 
-                results.append(write_pb.WriteResult(update_time=commit_time))
+            with ExitStack() as stack:
+                for col in sorted_cols:
+                    stack.enter_context(storage.lock(col, exclusive=True))
+
+                docs_cache = {col: storage.read_collection(col) for col in sorted_cols}
+
+                for operation in request.writes:
+                    self._apply_write_to_docs(operation, docs_cache, context, now)
+                    results.append(write_pb.WriteResult(update_time=commit_time))
+
+                for col in sorted_cols:
+                    storage.write_collection(col, docs_cache[col])
 
             yield firestore_pb.WriteResponse(
                 stream_id=stream_id,
@@ -196,9 +295,73 @@ class FirestoreEmulatorService:
                 commit_time=commit_time,
             )
 
+    def _apply_write_to_docs(
+        self,
+        operation: write_pb.Write,
+        docs_cache: dict[str, dict[str, dict[str, Any]]],
+        context: grpc.ServicerContext,
+        now: datetime,
+    ) -> None:
+        op_kind = operation._pb.WhichOneof("operation")
+        _, _, collection_path, doc_id = _parse_document_name(_get_doc_name_safe(operation, context))
+        docs = docs_cache[collection_path]
+
+        if op_kind == "update":
+            doc = operation.update
+            existing = docs.get(doc_id)
+            exists = existing is not None
+            _check_precondition(operation.current_document, exists, context)
+
+            existing_data = existing or {}
+            incoming = _helpers.decode_dict(doc.fields, client=None)
+            result = incoming
+
+            if operation.update_mask and operation.update_mask.field_paths:
+                transform_paths = {t.field_path for t in operation.update_transforms}
+                result = _apply_update_mask(
+                    existing_data,
+                    incoming,
+                    operation.update_mask.field_paths,
+                    preserve_missing_paths=transform_paths,
+                )
+            elif not incoming and operation.update_transforms:
+                result = copy.deepcopy(existing_data)
+
+            if operation.update_transforms:
+                for transform in operation.update_transforms:
+                    _apply_field_transform(result, transform, now, context)
+
+            docs[doc_id] = result
+
+        elif op_kind == "delete":
+            _check_precondition(operation.current_document, doc_id in docs, context)
+            docs.pop(doc_id, None)
+
+        elif op_kind == "transform":
+            transform = operation.transform
+            existing = docs.get(doc_id)
+            exists = existing is not None
+            _check_precondition(operation.current_document, exists, context)
+
+            current = copy.deepcopy(existing or {})
+            for field_transform in transform.field_transforms:
+                _apply_field_transform(current, field_transform, now, context)
+            docs[doc_id] = current
+        else:
+            context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                f"Unsupported write operation: {op_kind}",
+            )
+
     def RunQuery(
         self, request: firestore_pb.RunQueryRequest, context: grpc.ServicerContext
     ) -> Iterable[firestore_pb.RunQueryResponse]:
+        if request.transaction:
+            self._prune_stale_transactions()
+            with self._txn_lock:
+                if request.transaction not in self._active_transactions:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Transaction not found")
+
         project, database, parent_doc_path = _parse_parent(request.parent)
         structured = request.structured_query
 
@@ -231,58 +394,6 @@ class FirestoreEmulatorService:
                 document=_as_document_message(name, snap.to_dict() or {}),
                 read_time=read_time,
             )
-
-    def _apply_update_write(self, operation: write_pb.Write, context: grpc.ServicerContext) -> None:
-        doc = operation.update
-        project, database, collection_path, doc_id = _parse_document_name(doc.name)
-        ref = self._client(project, database).collection(collection_path).document(doc_id)
-
-        exists = ref.get().exists
-        _check_precondition(operation.current_document, exists, context)
-
-        existing = ref.get().to_dict() or {}
-        incoming = _helpers.decode_dict(doc.fields, client=None)
-        result = incoming
-
-        if operation.update_mask and operation.update_mask.field_paths:
-            transform_paths = {t.field_path for t in operation.update_transforms}
-            result = _apply_update_mask(
-                existing,
-                incoming,
-                operation.update_mask.field_paths,
-                preserve_missing_paths=transform_paths,
-            )
-        elif not incoming and operation.update_transforms:
-            # Firestore sends transform-only updates with an empty update document.
-            # Start from the existing payload, then apply transforms.
-            result = dict(existing)
-
-        if operation.update_transforms:
-            now = datetime.now(UTC)
-            for transform in operation.update_transforms:
-                _apply_field_transform(result, transform, now, context)
-
-        ref.set(result)
-
-    def _apply_delete_write(self, operation: write_pb.Write, context: grpc.ServicerContext) -> None:
-        project, database, collection_path, doc_id = _parse_document_name(operation.delete)
-        ref = self._client(project, database).collection(collection_path).document(doc_id)
-        _check_precondition(operation.current_document, ref.get().exists, context)
-        ref.delete()
-
-    def _apply_transform_write(self, operation: write_pb.Write, context: grpc.ServicerContext) -> None:
-        transform = operation.transform
-        project, database, collection_path, doc_id = _parse_document_name(transform.document)
-        ref = self._client(project, database).collection(collection_path).document(doc_id)
-        exists = ref.get().exists
-        _check_precondition(operation.current_document, exists, context)
-
-        current = ref.get().to_dict() or {}
-        now = datetime.now(UTC)
-        for field_transform in transform.field_transforms:
-            _apply_field_transform(current, field_transform, now, context)
-
-        ref.set(current)
 
     def _client(self, project: str, database: str) -> Client:
         db_root = self._storage_root / project / database
@@ -328,6 +439,16 @@ def start_grpc_emulator(
             service.BatchGetDocuments,
             request_deserializer=firestore_pb.BatchGetDocumentsRequest.deserialize,
             response_serializer=firestore_pb.BatchGetDocumentsResponse.serialize,
+        ),
+        "BeginTransaction": grpc.unary_unary_rpc_method_handler(
+            service.BeginTransaction,
+            request_deserializer=firestore_pb.BeginTransactionRequest.deserialize,
+            response_serializer=firestore_pb.BeginTransactionResponse.serialize,
+        ),
+        "Rollback": grpc.unary_unary_rpc_method_handler(
+            service.Rollback,
+            request_deserializer=firestore_pb.RollbackRequest.deserialize,
+            response_serializer=empty_pb2.Empty.SerializeToString,
         ),
         "Commit": grpc.unary_unary_rpc_method_handler(
             service.Commit,
@@ -419,7 +540,7 @@ def _apply_update_mask(
     field_paths: Iterable[str],
     preserve_missing_paths: set[str] | None = None,
 ) -> dict[str, Any]:
-    merged = dict(existing)
+    merged = copy.deepcopy(existing)
     preserve_missing_paths = preserve_missing_paths or set()
 
     for path in field_paths:
@@ -695,3 +816,17 @@ def _unwrap_scalar(value: Any) -> Any:
     if hasattr(value, "value"):
         return value.value
     return value
+
+def _get_doc_name_safe(operation: write_pb.Write, context: grpc.ServicerContext) -> str:
+    op_kind = operation._pb.WhichOneof("operation")
+    if op_kind == "update":
+        return operation.update.name
+    if op_kind == "delete":
+        return operation.delete
+    if op_kind == "transform":
+        return operation.transform.document
+    
+    context.abort(
+        grpc.StatusCode.INVALID_ARGUMENT,
+        f"Unknown or missing write operation: {op_kind}",
+    )

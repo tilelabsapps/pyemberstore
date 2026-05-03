@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -87,30 +89,54 @@ def create_app(storage_root: str | Path) -> FastAPI:
         write_results: list[dict[str, Any]] = []
 
         client = _client_for(project, database)
+        storage = client._storage
 
-        for write_op in writes:
-            if "update" in write_op:
-                doc = write_op["update"]
-                collection_path, doc_id = _parse_doc_path(doc["name"])
-                data = _decode_document_body(doc)
-                update_mask = write_op.get("updateMask")
-                ref = client.collection(collection_path).document(doc_id)
+        # Group by collection to identify what to lock
+        affected_cols: set[str] = set()
+        for op in writes:
+            name = op.get("update", {}).get("name") or op.get("delete")
+            if not name:
+                continue
+            col_path, _ = _parse_doc_path(name)
+            affected_cols.add(col_path)
 
-                if update_mask and update_mask.get("fieldPaths"):
-                    existing = ref.get().to_dict() or {}
-                    merged = _apply_update_mask(existing, data, update_mask["fieldPaths"])
-                    ref.set(merged)
+        sorted_cols = sorted(list(affected_cols))
+
+        with ExitStack() as stack:
+            for col in sorted_cols:
+                stack.enter_context(storage.lock(col, exclusive=True))
+
+            docs_cache = {col: storage.read_collection(col) for col in sorted_cols}
+
+            for write_op in writes:
+                name = write_op.get("update", {}).get("name") or write_op.get("delete")
+                if not name:
+                    write_results.append({"updateTime": commit_time})
+                    continue
+
+                col_path, doc_id = _parse_doc_path(name)
+                docs = docs_cache[col_path]
+
+                if "update" in write_op:
+                    doc = write_op["update"]
+                    data = _decode_document_body(doc)
+                    update_mask = write_op.get("updateMask")
+
+                    if update_mask and update_mask.get("fieldPaths"):
+                        existing = docs.get(doc_id) or {}
+                        merged = _apply_update_mask(existing, data, update_mask["fieldPaths"])
+                        docs[doc_id] = merged
+                    else:
+                        docs[doc_id] = data
+                elif "delete" in write_op:
+                    docs.pop(doc_id, None)
                 else:
-                    ref.set(data)
+                    raise HTTPException(status_code=400, detail="Unsupported write operation")
 
-            elif "delete" in write_op:
-                collection_path, doc_id = _parse_doc_path(write_op["delete"])
-                client.collection(collection_path).document(doc_id).delete()
+                write_results.append({"updateTime": commit_time})
 
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported write operation")
-
-            write_results.append({"updateTime": commit_time})
+            for col in sorted_cols:
+                storage.write_collection(col, docs_cache[col])
 
         return {
             "streamId": stream_id,
@@ -172,7 +198,7 @@ def _apply_update_mask(
     field_paths: list[str],
 ) -> dict[str, Any]:
     """Apply a list of dot-separated field paths as a merge mask."""
-    merged = dict(existing)
+    merged = copy.deepcopy(existing)
     for path in field_paths:
         parts = path.split(".")
         # Look up value in incoming

@@ -105,32 +105,35 @@ class DocumentReference:
         return DocumentSnapshot(id=self._doc_id, _data=copy.deepcopy(docs[self._doc_id]))
 
     def set(self, data: dict[str, Any], merge: bool = False) -> None:
-        docs = self._storage.read_collection(self._collection_name)
+        with self._storage.lock(self._collection_name, exclusive=True):
+            docs = self._storage.read_collection(self._collection_name)
 
-        if merge and self._doc_id in docs:
-            current = docs[self._doc_id]
-            docs[self._doc_id] = {**current, **copy.deepcopy(data)}
-        else:
-            docs[self._doc_id] = copy.deepcopy(data)
+            if merge and self._doc_id in docs:
+                current = docs[self._doc_id]
+                docs[self._doc_id] = {**current, **copy.deepcopy(data)}
+            else:
+                docs[self._doc_id] = copy.deepcopy(data)
 
-        self._storage.write_collection(self._collection_name, docs)
+            self._storage.write_collection(self._collection_name, docs)
 
     def update(self, data: dict[str, Any]) -> None:
-        docs = self._storage.read_collection(self._collection_name)
-        if self._doc_id not in docs:
-            raise DocumentNotFoundError(
-                f"Document '{self._doc_id}' does not exist in '{self._collection_name}'"
-            )
+        with self._storage.lock(self._collection_name, exclusive=True):
+            docs = self._storage.read_collection(self._collection_name)
+            if self._doc_id not in docs:
+                raise DocumentNotFoundError(
+                    f"Document '{self._doc_id}' does not exist in '{self._collection_name}'"
+                )
 
-        current = docs[self._doc_id]
-        docs[self._doc_id] = {**current, **copy.deepcopy(data)}
-        self._storage.write_collection(self._collection_name, docs)
+            current = docs[self._doc_id]
+            docs[self._doc_id] = {**current, **copy.deepcopy(data)}
+            self._storage.write_collection(self._collection_name, docs)
 
     def delete(self) -> None:
-        docs = self._storage.read_collection(self._collection_name)
-        if self._doc_id in docs:
-            del docs[self._doc_id]
-            self._storage.write_collection(self._collection_name, docs)
+        with self._storage.lock(self._collection_name, exclusive=True):
+            docs = self._storage.read_collection(self._collection_name)
+            if self._doc_id in docs:
+                del docs[self._doc_id]
+                self._storage.write_collection(self._collection_name, docs)
 
 
 def _resolve_field_path(document: dict[str, Any], field_path: str) -> Any:
